@@ -6,7 +6,7 @@ import json
 import re
 import shutil
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 import requests
 import streamlit as st
@@ -95,15 +95,49 @@ def ext_from_url(u: str) -> str:
             return ext if ext != ".jpeg" else ".jpg"
     return ".mp4"
 
-def download_bytes(url: str) -> tuple[bytes, str]:
-    r = requests.get(url, headers=HEADERS, allow_redirects=True, timeout=120, stream=True)
+def sanitize_instagram_cdn_url(u: str) -> str:
+    """Remove byte-range query params and keep signed parts intact."""
+    try:
+        p = urlparse(u)
+        q = dict(parse_qsl(p.query, keep_blank_values=True))
+        for k in list(q.keys()):
+            if k.lower() in ("bytestart", "byteend", "range"):
+                q.pop(k, None)
+        new_q = urlencode(q, doseq=True)
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, new_q, p.fragment))
+    except Exception:
+        return u
+
+def download_bytes(url: str) -> tuple[bytes, str, int]:
+    """
+    Robust downloader with IG-friendly headers. Returns (content, content_type, http_status).
+    """
+    s = requests.Session()
+    base_headers = {
+        "User-Agent": HEADERS["User-Agent"],
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+        "Referer": "https://www.instagram.com/",
+    }
+
+    def do_get(u):
+        return s.get(u, headers=base_headers, allow_redirects=True, timeout=60, stream=True)
+
+    clean = sanitize_instagram_cdn_url(url)
+    r = do_get(clean)
+    if r.status_code in (403, 404, 416):
+        r = do_get(url)  # try original if clean failed
+
     if r.status_code >= 400:
         raise RuntimeError(f"Download failed: HTTP {r.status_code}")
+
     bio = io.BytesIO()
-    for chunk in r.iter_content(chunk_size=8192):
+    for chunk in r.iter_content(chunk_size=1024 * 64):
         if chunk:
             bio.write(chunk)
-    return bio.getvalue(), r.headers.get("content-type", "")
+
+    return bio.getvalue(), r.headers.get("content-type", ""), r.status_code
 
 # =========================
 # Fast IG HTML extraction (OpenGraph/JSON) — no browser
@@ -114,45 +148,44 @@ def extract_from_instagram_html(url: str):
         return None, None
     text = r.text
 
-    # 1) og:video / og:video:secure_url
     m = re.search(r'<meta[^>]+property=["\']og:video["\'][^>]+content=["\']([^"\']+)["\']', text, re.IGNORECASE)
     if not m:
         m = re.search(r'<meta[^>]+property=["\']og:video:secure_url["\'][^>]+content=["\']([^"\']+)["\']', text, re.IGNORECASE)
-    if m:
-        return html.unescape(m.group(1)), "video"
+    if m: return html.unescape(m.group(1)), "video"
 
-    # 2) "video_url":"...mp4"
     m = re.search(r'"video_url"\s*:\s*"([^"]+\.mp4[^"]*)"', text)
-    if m:
-        return html.unescape(m.group(1)), "video"
+    if m: return html.unescape(m.group(1)), "video"
 
-    # 3) "contentUrl":"...mp4"
     m = re.search(r'"contentUrl"\s*:\s*"([^"]+\.mp4[^"]*)"', text)
-    if m:
-        return html.unescape(m.group(1)), "video"
+    if m: return html.unescape(m.group(1)), "video"
 
-    # 4) image fallback
     m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', text, re.IGNORECASE)
-    if m:
-        return html.unescape(m.group(1)), "image"
+    if m: return html.unescape(m.group(1)), "image"
+
     m = re.search(r'"display_url"\s*:\s*"([^"]+)"', text)
-    if m:
-        return html.unescape(m.group(1)), "image"
+    if m: return html.unescape(m.group(1)), "image"
 
     return None, None
 
 # =========================
 # Playwright NETWORK SNIFFER (avoids blob:)
 # =========================
-async def extract_instagram_media_network(ig_url: str, wait_seconds: int = 8):
+async def extract_instagram_media_network(ig_url: str, wait_seconds: int = 8, debug: bool = False):
     """
     Open IG page in headless Chromium, sniff network for actual media (.mp4/.m3u8).
-    Returns (media_url, media_type) or (None, None).
+    Returns (best_url, media_type, all_urls_list).
     """
+    MEDIA_HOSTS = ("instagram.", "cdninstagram.", "fbcdn", "fna.fbcdn.net", "cdn.fb")
     def is_media(u: str):
         if not u: return False
         ul = u.lower()
-        return (".mp4" in ul) or (".m3u8" in ul) or ("fbcdn" in ul and ("video" in ul or ".mp4" in ul))
+        if any(h in ul for h in MEDIA_HOSTS):
+            if ".mp4" in ul or ".m3u8" in ul:
+                return True
+            # sometimes path hints
+            if "/video/" in ul or "video" in ul:
+                return True
+        return (".mp4" in ul) or (".m3u8" in ul)
 
     candidates = []
     seen = set()
@@ -179,7 +212,7 @@ async def extract_instagram_media_network(ig_url: str, wait_seconds: int = 8):
             try: await page.click(sel, timeout=1200)
             except: pass
 
-        # let network idle + wait a bit
+        # wait for network
         try:
             await page.wait_for_load_state("networkidle", timeout=3000)
         except: pass
@@ -188,12 +221,22 @@ async def extract_instagram_media_network(ig_url: str, wait_seconds: int = 8):
         await context.close()
         await browser.close()
 
-    # prefer mp4 over m3u8
+    # prefer mp4 over m3u8; also prefer URLs without query-range
     mp4s  = [u for u in candidates if ".mp4" in u.lower()]
     m3u8s = [u for u in candidates if ".m3u8" in u.lower()]
-    if mp4s:  return mp4s[0], "video"
-    if m3u8s: return m3u8s[0], "video"
-    return None, None
+
+    best = None
+    if mp4s:
+        # simple heuristic: prefer shortest querystring (less likely to be partial ranges)
+        best = sorted(mp4s, key=lambda u: len(urlparse(u).query or ""))[0]
+        media_type = "video"
+    elif m3u8s:
+        best = m3u8s[0]
+        media_type = "video"
+    else:
+        best, media_type = None, None
+
+    return best, media_type, candidates
 
 # =========================
 # Inputs
@@ -207,8 +250,9 @@ hashtags_raw = st.text_input("Hashtags", placeholder="love, vibes", help="Comma 
 datetime_iso = st.text_input("Datetime (ISO)", value=datetime.now().isoformat(timespec="seconds"))
 filename_hint= st.text_input("Optional filename hint", placeholder="sunset-walk")
 
-confirm = st.checkbox("I confirm I own this content (or have explicit permission).", value=False)
-go = st.button("Upload to GitHub", type="primary", disabled=not confirm)
+show_debug   = st.checkbox("Show debug (all captured media URLs)")
+confirm      = st.checkbox("I confirm I own this content (or have explicit permission).", value=False)
+go           = st.button("Upload to GitHub", type="primary", disabled=not confirm)
 
 # =========================
 # Main
@@ -240,16 +284,26 @@ if go:
 
             if not media_url:
                 st.info("HTML failed. Sniffing network via Playwright (system Chromium)…")
-                media_url, media_type = asyncio.run(extract_instagram_media_network(ig_url))
+                best, media_type, all_urls = asyncio.run(
+                    extract_instagram_media_network(ig_url, wait_seconds=8, debug=show_debug)
+                )
+                if show_debug:
+                    st.write("All captured media-like URLs:")
+                    for u in all_urls:
+                        st.code(u)
+                media_url = best
 
             if not media_url:
                 st.error("Could not extract media from that IG URL on this host. Use a direct video URL or upload the file.")
                 st.stop()
 
             st.write(f"Found {media_type}: {media_url}")
-            data, ct = download_bytes(media_url)
+            media_url = sanitize_instagram_cdn_url(media_url)
+            data, ct, status = download_bytes(media_url)
+            st.caption(f"Downloaded with HTTP {status} • Content-Type: {ct or 'unknown'}")
+
             bytes_data = data
-            if media_type == "image":
+            if "image" in (ct or ""):
                 ext = ".jpg"
             else:
                 if "webm" in (ct or ""):        ext = ".webm"
@@ -269,14 +323,16 @@ if go:
             if not video_url.startswith("https://"):
                 st.error("Direct video URL must start with https://")
                 st.stop()
-            data, ct = download_bytes(video_url)
+            vurl = sanitize_instagram_cdn_url(video_url)
+            data, ct, status = download_bytes(vurl)
+            st.caption(f"Downloaded with HTTP {status} • Content-Type: {ct or 'unknown'}")
             bytes_data = data
             if len(bytes_data) > 95 * 1024 * 1024:
                 st.error("Remote file > 95MB (GitHub Contents API limit). Use LFS/another host.")
                 st.stop()
             if "webm" in (ct or ""):        ext = ".webm"
             elif "quicktime" in (ct or ""): ext = ".mov"
-            else:                            ext = ext_from_url(video_url)
+            else:                            ext = ext_from_url(vurl)
 
         else:
             st.error("Provide an Instagram URL, a direct video URL, or upload a file.")
