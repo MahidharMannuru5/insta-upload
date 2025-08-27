@@ -13,18 +13,19 @@ import streamlit as st
 from playwright.async_api import async_playwright
 
 # =========================
-# Streamlit & Page Setup
+# Streamlit UI
 # =========================
 st.set_page_config(page_title="IG → GitHub Uploader", page_icon="🎥", layout="centered")
 st.title("🎥 Instagram → GitHub (Your Content Only)")
 
 st.markdown(
-    "Paste an **Instagram Reel/Post URL** you own (public), or a **direct video URL**, or **upload a file**. "
-    "This app will upload the media to your repo and update `reels.json`."
+    "Paste a **public Instagram post/reel URL** you own, or a **direct video URL**, or **upload a file**. "
+    "This will upload to your repo and update `reels.json`.\n\n"
+    "⚠️ Use only content you own or have permission for."
 )
 
 # =========================
-# Config via Secrets
+# Secrets / Config
 # =========================
 GITHUB_TOKEN  = st.secrets.get("GITHUB_TOKEN", "")
 GITHUB_OWNER  = st.secrets.get("GITHUB_OWNER", "MahidharMannuru5")
@@ -34,9 +35,6 @@ GITHUB_BRANCH = st.secrets.get("GITHUB_BRANCH", "main")
 MEDIA_PATH_DIR  = st.secrets.get("MEDIA_PATH_DIR", "insta-reels/public/media")
 REELS_JSON_PATH = st.secrets.get("REELS_JSON_PATH", "insta-reels/src/components/reels.json")
 
-# =========================
-# HTTP defaults
-# =========================
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -46,10 +44,9 @@ HEADERS = {
 IG_TIMEOUT = 60
 
 # =========================
-# Chromium path (system)
+# System Chromium path (for Streamlit Cloud with packages.txt)
 # =========================
 def chromium_path():
-    # Prefer system chromium installed via packages.txt
     return (shutil.which("chromium")
             or shutil.which("chromium-browser")
             or "/usr/bin/chromium")
@@ -109,7 +106,7 @@ def download_bytes(url: str) -> tuple[bytes, str]:
     return bio.getvalue(), r.headers.get("content-type", "")
 
 # =========================
-# IG extraction — HTML (fast)
+# Fast IG HTML extraction (OpenGraph/JSON) — no browser
 # =========================
 def extract_from_instagram_html(url: str):
     r = requests.get(url, headers=HEADERS, timeout=IG_TIMEOUT)
@@ -145,13 +142,24 @@ def extract_from_instagram_html(url: str):
     return None, None
 
 # =========================
-# IG extraction — Playwright (your logic, async)
+# Playwright NETWORK SNIFFER (avoids blob:)
 # =========================
-async def extract_public_media_url(ig_url: str):
+async def extract_instagram_media_network(ig_url: str, wait_seconds: int = 8):
     """
-    EXACT logic pattern you shared: open page, try <video src>, fallback to <img>.
-    Uses system Chromium via packages.txt.
+    Open IG page in headless Chromium, sniff network for actual media (.mp4/.m3u8).
+    Returns (media_url, media_type) or (None, None).
     """
+    def is_media(u: str):
+        if not u: return False
+        ul = u.lower()
+        return (".mp4" in ul) or (".m3u8" in ul) or ("fbcdn" in ul and ("video" in ul or ".mp4" in ul))
+
+    candidates = []
+    seen = set()
+    def add(u: str):
+        if not u or u in seen: return
+        seen.add(u); candidates.append(u)
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -161,30 +169,34 @@ async def extract_public_media_url(ig_url: str):
         context = await browser.new_context(user_agent=HEADERS["User-Agent"])
         page = await context.new_page()
 
+        page.on("request",  lambda req: add(req.url) if is_media(req.url) else None)
+        page.on("response", lambda res: add(res.url) if is_media(res.url) else None)
+
+        await page.goto(ig_url, wait_until="domcontentloaded", timeout=60000)
+
+        # try to poke the player
+        for sel in ["video", ".vjs-big-play-button", "button:has-text('Play')", "[autoplay]"]:
+            try: await page.click(sel, timeout=1200)
+            except: pass
+
+        # let network idle + wait a bit
         try:
-            await page.goto(ig_url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(3000)
+            await page.wait_for_load_state("networkidle", timeout=3000)
+        except: pass
+        await page.wait_for_timeout(wait_seconds * 1000)
 
-            video = await page.query_selector("video")
-            if video:
-                video_url = await video.get_attribute("src")
-                if video_url:
-                    return video_url, "video"
+        await context.close()
+        await browser.close()
 
-            img = await page.query_selector("img[decoding='auto'], article img")
-            if img:
-                img_url = await img.get_attribute("src")
-                if img_url:
-                    return img_url, "image"
-
-        finally:
-            await context.close()
-            await browser.close()
-
+    # prefer mp4 over m3u8
+    mp4s  = [u for u in candidates if ".mp4" in u.lower()]
+    m3u8s = [u for u in candidates if ".m3u8" in u.lower()]
+    if mp4s:  return mp4s[0], "video"
+    if m3u8s: return m3u8s[0], "video"
     return None, None
 
 # =========================
-# UI Inputs
+# Inputs
 # =========================
 ig_url      = st.text_input("Instagram URL (public, your content)", placeholder="https://www.instagram.com/reel/…/")
 video_url   = st.text_input("Direct video URL (optional)", placeholder="https://example.com/video.mp4")
@@ -199,7 +211,7 @@ confirm = st.checkbox("I confirm I own this content (or have explicit permission
 go = st.button("Upload to GitHub", type="primary", disabled=not confirm)
 
 # =========================
-# Main Action
+# Main
 # =========================
 if go:
     if not GITHUB_TOKEN:
@@ -207,10 +219,10 @@ if go:
         st.stop()
 
     try:
-        # hashtags -> list
+        # hashtags list
         tags = [t for t in re.split(r"[,\s]+", (hashtags_raw or "").strip()) if t]
 
-        # datetime -> ISO
+        # datetime ISO
         try:
             dt = datetime.fromisoformat(datetime_iso.replace("Z", "+00:00"))
         except Exception:
@@ -218,7 +230,7 @@ if go:
             st.stop()
         dt_iso = dt.isoformat(timespec="seconds")
 
-        # resolve to bytes & extension
+        # resolve to bytes + extension
         bytes_data = None
         ext = ".mp4"
 
@@ -227,8 +239,8 @@ if go:
             media_url, media_type = extract_from_instagram_html(ig_url)
 
             if not media_url:
-                st.info("HTML failed. Launching headless Chromium via Playwright (system)…")
-                media_url, media_type = asyncio.run(extract_public_media_url(ig_url))
+                st.info("HTML failed. Sniffing network via Playwright (system Chromium)…")
+                media_url, media_type = asyncio.run(extract_instagram_media_network(ig_url))
 
             if not media_url:
                 st.error("Could not extract media from that IG URL on this host. Use a direct video URL or upload the file.")
@@ -276,7 +288,7 @@ if go:
         final_name = f"{ts}-{base}{ext}"
         media_path = f"{MEDIA_PATH_DIR}/{final_name}"
 
-        # commit media -> GitHub
+        # commit media
         b64 = base64.b64encode(bytes_data).decode("utf-8")
         gh_put_file(media_path, message=f"feat(media): add {final_name}", b64content=b64)
 
@@ -296,7 +308,7 @@ if go:
         raw_url = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{media_path}"
         new_entry = {
             "id": (max([int(x.get("id", 0)) for x in current] or [0]) + 1),
-            "src": f"{raw_url}?v={dt_iso}",   # cache-bust for your player
+            "src": f"{raw_url}?v={dt_iso}",  # cache-bust for your player
             "caption": caption or "",
             "hashtags": tags,
             "datetime": dt_iso,
