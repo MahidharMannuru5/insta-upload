@@ -1,15 +1,31 @@
+import asyncio
 import base64
+import html
 import io
 import json
 import re
-import html
+import shutil
 from datetime import datetime
 from urllib.parse import urlparse
 
 import requests
 import streamlit as st
+from playwright.async_api import async_playwright
 
-# ====== CONFIG (from Streamlit Secrets) ======
+# =========================
+# Streamlit & Page Setup
+# =========================
+st.set_page_config(page_title="IG → GitHub Uploader", page_icon="🎥", layout="centered")
+st.title("🎥 Instagram → GitHub (Your Content Only)")
+
+st.markdown(
+    "Paste an **Instagram Reel/Post URL** you own (public), or a **direct video URL**, or **upload a file**. "
+    "This app will upload the media to your repo and update `reels.json`."
+)
+
+# =========================
+# Config via Secrets
+# =========================
 GITHUB_TOKEN  = st.secrets.get("GITHUB_TOKEN", "")
 GITHUB_OWNER  = st.secrets.get("GITHUB_OWNER", "MahidharMannuru5")
 GITHUB_REPO   = st.secrets.get("GITHUB_REPO", "insta")
@@ -18,14 +34,29 @@ GITHUB_BRANCH = st.secrets.get("GITHUB_BRANCH", "main")
 MEDIA_PATH_DIR  = st.secrets.get("MEDIA_PATH_DIR", "insta-reels/public/media")
 REELS_JSON_PATH = st.secrets.get("REELS_JSON_PATH", "insta-reels/src/components/reels.json")
 
-# ====== HTTP defaults ======
+# =========================
+# HTTP defaults
+# =========================
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
     "Range": "bytes=0-",
 }
 IG_TIMEOUT = 60
 
-# ====== GitHub helpers ======
+# =========================
+# Chromium path (system)
+# =========================
+def chromium_path():
+    # Prefer system chromium installed via packages.txt
+    return (shutil.which("chromium")
+            or shutil.which("chromium-browser")
+            or "/usr/bin/chromium")
+
+# =========================
+# GitHub helpers
+# =========================
 def gh_headers():
     return {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -51,7 +82,9 @@ def gh_put_file(path: str, message: str, b64content: str, sha: str | None = None
     r.raise_for_status()
     return r.json()
 
-# ====== Utils ======
+# =========================
+# Utils
+# =========================
 def slugify(s: str) -> str:
     s = (s or "").lower()
     s = re.sub(r"[^a-z0-9]+", "-", s)
@@ -75,12 +108,10 @@ def download_bytes(url: str) -> tuple[bytes, str]:
             bio.write(chunk)
     return bio.getvalue(), r.headers.get("content-type", "")
 
-# ====== Instagram extraction via HTML meta/JSON ======
+# =========================
+# IG extraction — HTML (fast)
+# =========================
 def extract_from_instagram_html(url: str):
-    """
-    Try to extract media URL from a public Instagram post/reel page without a browser.
-    Returns (media_url, media_type) where media_type is 'video' or 'image', else (None, None).
-    """
     r = requests.get(url, headers=HEADERS, timeout=IG_TIMEOUT)
     if r.status_code >= 400:
         return None, None
@@ -93,17 +124,17 @@ def extract_from_instagram_html(url: str):
     if m:
         return html.unescape(m.group(1)), "video"
 
-    # 2) JSON blob "video_url":"...mp4"
+    # 2) "video_url":"...mp4"
     m = re.search(r'"video_url"\s*:\s*"([^"]+\.mp4[^"]*)"', text)
     if m:
         return html.unescape(m.group(1)), "video"
 
-    # 3) alt JSON fields sometimes used
+    # 3) "contentUrl":"...mp4"
     m = re.search(r'"contentUrl"\s*:\s*"([^"]+\.mp4[^"]*)"', text)
     if m:
         return html.unescape(m.group(1)), "video"
 
-    # 4) Photo fallback: og:image / display_url
+    # 4) image fallback
     m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', text, re.IGNORECASE)
     if m:
         return html.unescape(m.group(1)), "image"
@@ -113,17 +144,49 @@ def extract_from_instagram_html(url: str):
 
     return None, None
 
-# ====== Streamlit UI ======
-st.set_page_config(page_title="Upload my video to GitHub", page_icon="🎥", layout="centered")
-st.title("🎥 Push my (owned) video to GitHub")
+# =========================
+# IG extraction — Playwright (your logic, async)
+# =========================
+async def extract_public_media_url(ig_url: str):
+    """
+    EXACT logic pattern you shared: open page, try <video src>, fallback to <img>.
+    Uses system Chromium via packages.txt.
+    """
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            executable_path=chromium_path(),
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        context = await browser.new_context(user_agent=HEADERS["User-Agent"])
+        page = await context.new_page()
 
-st.markdown(
-    "Use **one** of the inputs below:\n\n"
-    "1) Paste an **Instagram post/reel URL** that you own → the app will try HTML extraction.\n\n"
-    "2) Paste a **direct video URL** (https://…/file.mp4) **or** upload a local file.\n"
-)
+        try:
+            await page.goto(ig_url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(3000)
 
-ig_url      = st.text_input("Instagram URL (your own content)", placeholder="https://www.instagram.com/reel/…/")
+            video = await page.query_selector("video")
+            if video:
+                video_url = await video.get_attribute("src")
+                if video_url:
+                    return video_url, "video"
+
+            img = await page.query_selector("img[decoding='auto'], article img")
+            if img:
+                img_url = await img.get_attribute("src")
+                if img_url:
+                    return img_url, "image"
+
+        finally:
+            await context.close()
+            await browser.close()
+
+    return None, None
+
+# =========================
+# UI Inputs
+# =========================
+ig_url      = st.text_input("Instagram URL (public, your content)", placeholder="https://www.instagram.com/reel/…/")
 video_url   = st.text_input("Direct video URL (optional)", placeholder="https://example.com/video.mp4")
 uploaded    = st.file_uploader("— or upload a local video file —", type=["mp4", "mov", "webm", "m4v"])
 
@@ -133,19 +196,21 @@ datetime_iso = st.text_input("Datetime (ISO)", value=datetime.now().isoformat(ti
 filename_hint= st.text_input("Optional filename hint", placeholder="sunset-walk")
 
 confirm = st.checkbox("I confirm I own this content (or have explicit permission).", value=False)
-submit  = st.button("Upload to GitHub", type="primary", disabled=not confirm)
+go = st.button("Upload to GitHub", type="primary", disabled=not confirm)
 
-# ====== Main action ======
-if submit:
+# =========================
+# Main Action
+# =========================
+if go:
     if not GITHUB_TOKEN:
-        st.error("Missing GITHUB_TOKEN in Streamlit secrets.")
+        st.error("Missing GITHUB_TOKEN in secrets.")
         st.stop()
 
     try:
-        # hashtags
+        # hashtags -> list
         tags = [t for t in re.split(r"[,\s]+", (hashtags_raw or "").strip()) if t]
 
-        # datetime
+        # datetime -> ISO
         try:
             dt = datetime.fromisoformat(datetime_iso.replace("Z", "+00:00"))
         except Exception:
@@ -153,15 +218,20 @@ if submit:
             st.stop()
         dt_iso = dt.isoformat(timespec="seconds")
 
-        # resolve input -> bytes + ext
+        # resolve to bytes & extension
         bytes_data = None
         ext = ".mp4"
 
         if ig_url:
-            st.info("Extracting media via HTML (must be your own public post)…")
+            st.info("Trying HTML extraction…")
             media_url, media_type = extract_from_instagram_html(ig_url)
+
             if not media_url:
-                st.error("Could not extract from that Instagram URL on this host. Try a direct video URL or upload the file.")
+                st.info("HTML failed. Launching headless Chromium via Playwright (system)…")
+                media_url, media_type = asyncio.run(extract_public_media_url(ig_url))
+
+            if not media_url:
+                st.error("Could not extract media from that IG URL on this host. Use a direct video URL or upload the file.")
                 st.stop()
 
             st.write(f"Found {media_type}: {media_url}")
@@ -178,7 +248,7 @@ if submit:
             st.info("Using uploaded file…")
             bytes_data = uploaded.read()
             if len(bytes_data) > 95 * 1024 * 1024:
-                st.error("File > 95MB (GitHub API limit). Use LFS/another host.")
+                st.error("File > 95MB (GitHub Contents API limit). Use LFS/another host.")
                 st.stop()
             ext = ext_from_url(uploaded.name or "")
 
@@ -190,7 +260,7 @@ if submit:
             data, ct = download_bytes(video_url)
             bytes_data = data
             if len(bytes_data) > 95 * 1024 * 1024:
-                st.error("Remote file > 95MB (GitHub API limit). Use LFS/another host.")
+                st.error("Remote file > 95MB (GitHub Contents API limit). Use LFS/another host.")
                 st.stop()
             if "webm" in (ct or ""):        ext = ".webm"
             elif "quicktime" in (ct or ""): ext = ".mov"
@@ -200,13 +270,13 @@ if submit:
             st.error("Provide an Instagram URL, a direct video URL, or upload a file.")
             st.stop()
 
-        # build filename/paths
+        # filename & paths
         ts   = dt_iso.replace(":", "-").replace(".", "-")
         base = slugify(filename_hint or caption or (ig_url or video_url))
         final_name = f"{ts}-{base}{ext}"
         media_path = f"{MEDIA_PATH_DIR}/{final_name}"
 
-        # commit media
+        # commit media -> GitHub
         b64 = base64.b64encode(bytes_data).decode("utf-8")
         gh_put_file(media_path, message=f"feat(media): add {final_name}", b64content=b64)
 
@@ -249,4 +319,3 @@ if submit:
 
     except Exception as e:
         st.error(f"Failed: {e}")
-        st.caption("If this IG URL doesn't expose og:video, use direct URL or upload the file.")
