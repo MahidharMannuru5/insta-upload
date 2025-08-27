@@ -3,8 +3,6 @@ import io
 import json
 import re
 import html
-import subprocess
-import traceback
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -26,32 +24,6 @@ HEADERS = {
     "Range": "bytes=0-",
 }
 IG_TIMEOUT = 60
-
-# ====== Try Playwright; install Chromium on demand ======
-try:
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-    PLAYWRIGHT_OK = True
-except Exception:
-    PLAYWRIGHT_OK = False
-
-def ensure_chromium_installed() -> bool:
-    """Ensure Playwright's Chromium is available in the cloud runtime."""
-    if not PLAYWRIGHT_OK:
-        return False
-    try:
-        with sync_playwright() as p:
-            p.chromium.launch(headless=True).close()
-        return True
-    except Exception:
-        pass
-    try:
-        subprocess.run(["playwright", "install", "chromium"], check=False, capture_output=True)
-        with sync_playwright() as p:
-            p.chromium.launch(headless=True).close()
-        return True
-    except Exception as e:
-        st.warning(f"Chromium install failed: {e}")
-        return False
 
 # ====== GitHub helpers ======
 def gh_headers():
@@ -76,8 +48,6 @@ def gh_put_file(path: str, message: str, b64content: str, sha: str | None = None
     if sha:
         body["sha"] = sha
     r = requests.put(url, headers=gh_headers(), data=json.dumps(body), timeout=120)
-    if r.status_code >= 400:
-        st.error(r.text)
     r.raise_for_status()
     return r.json()
 
@@ -95,9 +65,6 @@ def ext_from_url(u: str) -> str:
             return ext if ext != ".jpeg" else ".jpg"
     return ".mp4"
 
-def is_video_content_type(ct: str) -> bool:
-    return ct.startswith("video/")
-
 def download_bytes(url: str) -> tuple[bytes, str]:
     r = requests.get(url, headers=HEADERS, allow_redirects=True, timeout=120, stream=True)
     if r.status_code >= 400:
@@ -108,69 +75,42 @@ def download_bytes(url: str) -> tuple[bytes, str]:
             bio.write(chunk)
     return bio.getvalue(), r.headers.get("content-type", "")
 
-# ====== Instagram extraction (FAST) via HTML meta/JSON ======
-def extract_via_meta(url: str):
+# ====== Instagram extraction via HTML meta/JSON ======
+def extract_from_instagram_html(url: str):
+    """
+    Try to extract media URL from a public Instagram post/reel page without a browser.
+    Returns (media_url, media_type) where media_type is 'video' or 'image', else (None, None).
+    """
     r = requests.get(url, headers=HEADERS, timeout=IG_TIMEOUT)
     if r.status_code >= 400:
         return None, None
-    html_text = r.text
+    text = r.text
 
-    # og:video / og:video:secure_url
-    m = re.search(r'<meta[^>]+property=[\'"]og:video[\'"][^>]+content=[\'"]([^\'"]+)[\'"]', html_text, re.IGNORECASE)
+    # 1) og:video / og:video:secure_url
+    m = re.search(r'<meta[^>]+property=["\']og:video["\'][^>]+content=["\']([^"\']+)["\']', text, re.IGNORECASE)
     if not m:
-        m = re.search(r'<meta[^>]+property=[\'"]og:video:secure_url[\'"][^>]+content=[\'"]([^\'"]+)[\'"]', html_text, re.IGNORECASE)
+        m = re.search(r'<meta[^>]+property=["\']og:video:secure_url["\'][^>]+content=["\']([^"\']+)["\']', text, re.IGNORECASE)
     if m:
         return html.unescape(m.group(1)), "video"
 
-    # JSON blob "video_url":"...mp4"
-    m = re.search(r'"video_url"\s*:\s*"([^"]+\.mp4[^"]*)"', html_text)
+    # 2) JSON blob "video_url":"...mp4"
+    m = re.search(r'"video_url"\s*:\s*"([^"]+\.mp4[^"]*)"', text)
     if m:
         return html.unescape(m.group(1)), "video"
 
-    # photo fallback og:image
-    m = re.search(r'<meta[^>]+property=[\'"]og:image[\'"][^>]+content=[\'"]([^\'"]+)[\'"]', html_text, re.IGNORECASE)
+    # 3) alt JSON fields sometimes used
+    m = re.search(r'"contentUrl"\s*:\s*"([^"]+\.mp4[^"]*)"', text)
+    if m:
+        return html.unescape(m.group(1)), "video"
+
+    # 4) Photo fallback: og:image / display_url
+    m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', text, re.IGNORECASE)
+    if m:
+        return html.unescape(m.group(1)), "image"
+    m = re.search(r'"display_url"\s*:\s*"([^"]+)"', text)
     if m:
         return html.unescape(m.group(1)), "image"
 
-    return None, None
-
-# ====== Instagram extraction (Playwright) fallback ======
-def extract_media_from_instagram_sync(url: str):
-    if not ensure_chromium_installed():
-        return None, None
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-        )
-        context = browser.new_context(user_agent=HEADERS["User-Agent"])
-        page = context.new_page()
-        media_url, media_type = None, None
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-            page.wait_for_timeout(2500)
-
-            # try <video src> or <video><source src>
-            v_src = page.eval_on_selector("video", "el => el?.getAttribute('src')") or None
-            if not v_src:
-                v_src = page.eval_on_selector("video source", "el => el?.getAttribute('src')") or None
-            if v_src:
-                media_url, media_type = v_src, "video"
-                return media_url, media_type
-
-            # fallback to probable content image
-            i_src = page.eval_on_selector("article img", "el => el?.getAttribute('src')") or None
-            if not i_src:
-                i_src = page.eval_on_selector("img[decoding='auto']", "el => el?.getAttribute('src')") or None
-            if i_src:
-                return i_src, "image"
-
-        except Exception as e:
-            st.write("Playwright extractor error:", str(e))
-            st.write(traceback.format_exc())
-        finally:
-            context.close()
-            browser.close()
     return None, None
 
 # ====== Streamlit UI ======
@@ -179,7 +119,7 @@ st.title("🎥 Push my (owned) video to GitHub")
 
 st.markdown(
     "Use **one** of the inputs below:\n\n"
-    "1) Paste an **Instagram post/reel URL** that you own → the app will extract and upload.\n\n"
+    "1) Paste an **Instagram post/reel URL** that you own → the app will try HTML extraction.\n\n"
     "2) Paste a **direct video URL** (https://…/file.mp4) **or** upload a local file.\n"
 )
 
@@ -218,13 +158,10 @@ if submit:
         ext = ".mp4"
 
         if ig_url:
-            st.info("Extracting media from Instagram (must be your own content)…")
-            media_url, media_type = extract_via_meta(ig_url)
+            st.info("Extracting media via HTML (must be your own public post)…")
+            media_url, media_type = extract_from_instagram_html(ig_url)
             if not media_url:
-                media_url, media_type = extract_media_from_instagram_sync(ig_url)
-
-            if not media_url:
-                st.error("Could not extract media from the Instagram URL. Ensure the post is public and try again.")
+                st.error("Could not extract from that Instagram URL on this host. Try a direct video URL or upload the file.")
                 st.stop()
 
             st.write(f"Found {media_type}: {media_url}")
@@ -289,7 +226,7 @@ if submit:
         raw_url = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{media_path}"
         new_entry = {
             "id": (max([int(x.get("id", 0)) for x in current] or [0]) + 1),
-            "src": f"{raw_url}?v={dt_iso}",
+            "src": f"{raw_url}?v={dt_iso}",   # cache-bust for your player
             "caption": caption or "",
             "hashtags": tags,
             "datetime": dt_iso,
@@ -312,4 +249,4 @@ if submit:
 
     except Exception as e:
         st.error(f"Failed: {e}")
-        st.caption("See Streamlit app logs for details.")
+        st.caption("If this IG URL doesn't expose og:video, use direct URL or upload the file.")
